@@ -1,0 +1,77 @@
+#!/bin/bash
+
+set -e
+set -o pipefail
+
+exec 3>&1 # make stdout available as fd 3 for the result
+exec 1>&2 # redirect all output to stderr for logging
+
+if [ -f "$source/$namespace_overwrite" ]; then
+  namespace=$(cat $source/$namespace_overwrite)
+elif [ -n "$namespace_overwrite" ]; then
+  namespace=$namespace
+fi
+
+setup_kubernetes() {
+  payload=$1
+  source=$2
+
+  mkdir -p /root/.kube
+  kubeconfig_path=$(jq -r '.params.kubeconfig_path // ""' < $payload)
+  absolute_kubeconfig_path="${source}/${kubeconfig_path}"
+  kubeconfig=$(jq -r '.params.kubeconfig // ""' < $payload)
+  if [ ! -z "$kubeconfig" ]; then
+    echo "$kubeconfig" > /root/.kube/config
+    chmod 600 /root/.kube/config
+  elif [ -f "$absolute_kubeconfig_path" ]; then
+    cp "$absolute_kubeconfig_path" "/root/.kube/config"
+  else
+    # Setup kubectl
+    cluster_url=$(jq -r '.source.cluster_url // ""' < $payload)
+    if [ -z "$cluster_url" ]; then
+      echo "invalid payload (missing cluster_url)"
+      exit 1
+    fi
+    if [[ "$cluster_url" =~ https.* ]]; then
+      insecure_cluster=$(jq -r '.source.insecure_cluster // "false"' < $payload)
+      cluster_ca=$(jq -r '.source.cluster_ca // ""' < $payload)
+      cluster_ca_base64=$(jq -r '.source.cluster_ca_base64 // ""' < $payload)
+      admin_key=$(jq -r '.source.admin_key // ""' < $payload)
+      admin_cert=$(jq -r '.source.admin_cert // ""' < $payload)
+      token=$(jq -r '.source.token // ""' < $payload)
+      token_path=$(jq -r '.params.token_path // ""' < $payload)
+      if [ "$insecure_cluster" == "true" ]; then
+        kubectl config set-cluster default --server=$cluster_url --insecure-skip-tls-verify=true
+      else
+        ca_path="/root/.kube/ca.pem"
+        if [[ ! -z "$cluster_ca_base64" ]]; then
+          echo "$cluster_ca_base64" | base64 -d > $ca_path
+        elif [[ ! -z "$cluster_ca" ]]; then
+          echo "$cluster_ca" > $ca_path
+        else
+          echo "missing cluster_ca or cluster_ca_base64"
+          exit 1
+        fi
+        kubectl config set-cluster default --server=$cluster_url --certificate-authority=$ca_path
+      fi
+      if [ -f "$source/$token_path" ]; then
+        kubectl config set-credentials admin --token=$(cat $source/$token_path)
+      elif [ ! -z "$token" ]; then
+        kubectl config set-credentials admin --token=$token
+      else
+        mkdir -p /root/.kube
+        key_path="/root/.kube/key.pem"
+        cert_path="/root/.kube/cert.pem"
+        echo "$admin_key" | base64 -d > $key_path
+        echo "$admin_cert" | base64 -d > $cert_path
+        kubectl config set-credentials admin --client-certificate=$cert_path --client-key=$key_path
+      fi
+      kubectl config set-context default --cluster=default --user=admin --namespace=$namespace
+    else
+      kubectl config set-cluster default --server=$cluster_url
+      kubectl config set-context default --cluster=default --namespace=$namespace
+    fi
+    kubectl config use-context default
+  fi
+  kubectl version
+}
